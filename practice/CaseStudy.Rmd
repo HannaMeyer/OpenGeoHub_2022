@@ -1,0 +1,528 @@
+---
+title: "Spatial predictive modelling, cross-validation and the area of applicability"
+subtitle: "Tutorial for the OpenGeoHub Summer School 2022"
+author: "Hanna Meyer"
+date: "August 2022"
+output:
+  rmarkdown::html_document:
+    toc: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+#knitr::opts_chunk$set(fig.width = 8.83)
+```
+
+# Introduction
+
+This tutorial builds on the lecture given at the OpenGeoHub Summer School 2022.
+In this tutorial we will
+
+1.    discuss different cross-validation strategies for the assessment of model predictions
+
+2.    see how spatial variable selection can be used to improve spatial predictions
+
+3.    estimate and discuss the area of applicability of our prediction models
+
+To go through these steps we will use a simulated case study where we will model the suitability of occurrence of a virtual species. 
+
+
+
+## Getting started 
+
+Let's first load the required libraries. Major functionality discussed in the lecture is implemented in the R package 'CAST'. 'Caret' is used here for model training (although the introduced methods like the AOA can also be used with mlr3 and possibly also tidymodels). The case study uses a simulated prediction task based on the 'virtualspecies' package.
+This tutorial still uses the raster package to show things. Be aware that this needs to be changed in the near future...
+
+```{r libraries, message = FALSE, warning=FALSE}
+rm(list=ls())
+#install_github("HannaMeyer/CAST")
+library(virtualspecies)
+library(caret)
+library(CAST)
+library(viridis)
+library(sf)
+library(raster)
+library(gridExtra)
+library(knitr)
+library(grid)
+library(latticeExtra)
+
+# and let's set a seed for everything that involves randomness
+# Of course I took a seed here that produced results 
+# that looked best for the scope of the tutorial. 
+# But feel free to change to test other scenarios ;-)
+seed <- 2345
+```
+
+
+
+# Simulation of the training set
+
+Let's first define settings for the prediction task, like the number of training points, their distribution (in terms of clusters) as
+well as parameters on how to simulate the response.
+
+```{r settings, message = FALSE, warning=FALSE}
+studyarea <- c(-15, 65, 30, 75) # extent of study area. Default: Europe
+
+#### Simulated reference points:
+npoints <- 300 # number of training samples
+nclusters <- 10 #number of clusters if design==clustered
+maxdist <- 150000 #in unit m. size of the clusters
+
+#### Simulated predictors and response:
+predictornames <- c("bio1","bio2","bio5","bio6","bio7","bio10","bio11","bio12","bio13","bio14","bio15","bio18","bio19")
+simulateResponse <- c("bio2","bio5","bio10", "bio13", "bio14","bio19") # variables used to simulate the response
+meansPCA <- c(3, -1) # means of the gaussian response functions to the 2 axes
+sdPCA <- c(2, 2) # sd's of the gaussian response functions to the 2 axes
+
+
+```
+
+## Get data
+To prepare the predictors, the bio-climate data are downloaded and cropped to the defined study area.
+
+```{r data, message = FALSE, warning=FALSE}
+
+# download, select and crop predictors:
+predictors <- raster::getData('worldclim', var='bio', res=10)
+predictors <- predictors[[predictornames]]
+predictors <- crop(predictors,extent(studyarea))
+plot(predictors)
+
+#create a mask for land area:
+mask <- predictors[[1]]
+values(mask)[!is.na(values(mask))] <- 1
+mask <- st_as_sf(rasterToPolygons(mask,dissolve=TRUE))
+
+```
+
+
+## Generate Predictors and Response
+The virtual response variable is created based on the PCA of a subset of the bioclim predictors. See the virtualspecies package for further information.
+
+```{r variables, message = FALSE, warning=FALSE}
+response_vs <- generateSpFromPCA(predictors[[simulateResponse]],
+                                 means = meansPCA,sds = sdPCA, plot=F)
+
+response <- response_vs$suitab.raster
+
+```
+
+## Simulate training points
+When looking at typical global prediction studies, we can see that reference data that are used for model training are often extremely clustered in geographic space (see https://www.nature.com/articles/s41467-022-29838-9).
+To simulate field locations that are typically used as training data, "nclusters" locations are randomly selected (center of clusters).
+The "npoints" are then distributed over the clusters, with a maximum distance of "maxdist" meters around the center of each cluster.
+
+
+```{r clusteredpoints, message = FALSE, include=FALSE, warning=FALSE}
+#For a clustered sesign:
+# adjusted from from https://github.com/carlesmila/NNDMpaper/blob/main/code/sim_utils.R
+clustered_sample <- function(sarea, nsamples, nparents, radius, seed){
+  # Number of offspring per parent
+  nchildren <- round((nsamples-nparents)/nparents, 0)
+  # Simulate parents
+  set.seed(seed)
+  parents <- st_sf(geometry=st_sample(sarea, nparents, type="random"))
+  res <- parents
+  res$clstrID <- 1:nrow(parents)
+  # Simulate offspring
+  for(i in 1:nrow(parents)){
+    # Generate buffer and cut parts outside of the area of study
+    buf <- st_buffer(parents[i,], dist=radius)
+    buf <- st_intersection(buf, sarea)
+    # Simulate children
+    set.seed(seed)
+    children <- st_sf(geometry=st_sample(buf, nchildren, type="random"))
+      children$clstrID <- i
+    res <- rbind(res, children)
+  }
+  return(res)
+}
+```
+
+```{r samplepoints, message = FALSE, warning=FALSE}
+
+samplepoints <- clustered_sample(mask,npoints,nclusters,radius=maxdist,seed=seed)
+
+```
+
+
+
+
+Now let's visualize the created response variable and the training data points
+
+```{r vis_data, message = FALSE, echo = FALSE, warning=FALSE}
+
+plot(response,main="response")
+plot(samplepoints,add=T, col="black",cex=0.5)
+legend("topleft",pch=1,legend=c("training","validation"),bty="n",col=c("black","blue"),pt.cex=c(0.5,0.1))
+```
+
+
+
+# Model training and prediction
+
+## Preparation
+To prepare model training, predictor variables are extracted for the location of the selected sample data locations.
+The merged data.frame contains all information that are required for model training.
+
+
+```{r traindat, message=FALSE, warning= FALSE}
+# extract predictor and response values at the location of the reference sites
+trainDat <- extract(predictors,samplepoints,df=TRUE)
+trainDat$response <- extract (response,samplepoints)
+
+# merge with the reference information
+#samplepoints$ID <- seq(nrow(samplepoints))
+#trainDat <- merge(trainDat,st_drop_geometry(samplepoints),by.x="ID",by.y="ID")
+
+head(trainDat)
+```
+
+
+
+## A first simple model
+
+As a very first naive approach, we simply run a random forest with default settings to produce a spatial prediction.
+
+```{r training1, message=FALSE, warning= FALSE}
+
+### model training with default random CV
+
+firstmodel <- train(trainDat[,names(predictors)],
+                 trainDat$response,
+                 method="rf")
+firstprediction <- predict(predictors,firstmodel)
+plot(firstprediction)
+```
+
+So we see that technically, it's no problem to train a random forest model and produce predictions for entire Europe.
+But the question is now...how good is this prediction model ?
+
+# Model validation using cross-validation (CV) strategies
+
+To answer the question about the quality of the predictions, we will compare three different strategies here: A "default" random CV, a spatial CV which will be a "leave cluster out" CV in this example, and the nearest neighbor distance matching approach (NNDM, see https://doi.org/10.1111/2041-210X.13851).
+
+So let's first define the folds for each strategy:
+```{r CV, message=FALSE, warning= FALSE}
+
+# Random CV
+random_cv <- createFolds(trainDat$response,k=10,returnTrain=FALSE)
+str(random_cv)
+
+# Leave-Cluster-Out "Spatial" CV
+spatial_cv <- CreateSpacetimeFolds(samplepoints, spacevar="clstrID",k=nclusters)
+str(spatial_cv)
+
+# Nearest neighbor Distance Matching
+NNDM_cv <- nndm(samplepoints,mask)
+print(NNDM_cv)
+```
+
+
+## How representative are these strategies? 
+Next, we visualize how well the cross-validation strategies reflect the difficulty of the prediction task.
+Therefore, we compare the required degree of spatial extrapolation to the degree of spatial extrapolation created during CV.
+The plots show the following:   In red is the nearest neighbor distance distribution within the training dataset, i.e. how far away are the reference data points to their nearest neighbor?
+In green, we see the nearest neighbor distance distribution for the prediction area. Hence, we see how far away the new prediction lcoations are from the nearest training data point.
+In blue we see the same for the prediction situations created during CV.
+
+
+```{r geodist, message=FALSE, warning= FALSE}
+dist_random <- plot_geodist(x=samplepoints,cvfolds=random_cv,modeldomain=mask,showPlot = FALSE)
+dist_spatial <- plot_geodist(x=samplepoints,cvfolds=spatial_cv$indexOut,modeldomain=mask,showPlot = FALSE)
+dist_NNDM <- plot_geodist(x=samplepoints,cvfolds=NNDM_cv$indx_test,cvtrain=NNDM_cv$indx_train,modeldomain=mask,showPlot = FALSE)
+
+dist_random$plot+scale_x_log10(labels=round)+ggtitle("Random CV")
+dist_spatial$plot+scale_x_log10(labels=round)+ggtitle("'Spatial' CV")
+dist_NNDM$plot+scale_x_log10(labels=round)+ggtitle("NNDM")
+```
+
+
+As we can see, when using a random CV, we're testing how well the model can make predictions for new data points that are very close to something that is already known.
+Spatial CV and NNDM, in contrast, reflect the ability of the model to make predictions for new locations that are much further away from the reference data.
+This comes much closer to what is actually required when making predictions.
+Note that NNDM produces prediction situations (in terms of geographic distance) that are highly comparable to what is required during predictions (this is not surprising ebcause the NNDM method trys to match these distributions).
+
+
+## Effect of different cross-validation strategies on performance assessment
+
+Next, let's explore the effect of different cross-validation strategies on the estimated model model performance.
+Therefore, we train the model three times, each one using one of the three CV strategies.
+
+```{r training, message=FALSE, warning= FALSE}
+
+### model training with default random CV
+
+model_random <- train(trainDat[,names(predictors)],
+                 trainDat$response,
+                 method="rf",
+                 ntree=100,
+                 importance=TRUE,
+                 tuneGrid = data.frame("mtry"=2),
+                 trControl = trainControl(method="cv",savePredictions = TRUE))
+model_random  
+
+
+### model training with a classic spatial CV
+model_spatial <- train(trainDat[,names(predictors)],
+                 trainDat$response,
+                 method="rf",
+                 ntree=100,
+                 importance=TRUE,
+                 tuneGrid = data.frame("mtry"=2),
+                 trControl = trainControl(method="cv",
+                                          index=spatial_cv$index,
+                                          savePredictions = TRUE))
+model_spatial
+  
+
+### model training with NNDM CV  
+
+model_nndm <- train(trainDat[,names(predictors)],
+                 trainDat$response,
+                 method="rf",
+                 ntree=100,
+                 importance=TRUE,
+                 tuneGrid = data.frame("mtry"=2),
+                 trControl = trainControl(method="cv",
+                                          index=NNDM_cv$indx_train,
+                                          indexOut=NNDM_cv$indx_test,
+                                          savePredictions = TRUE))
+model_nndm
+
+```
+
+
+We see that the random CV suggests a very high prediction performance, while the other two approaches are rather pessimistic.
+But which one is most reliable? Let's see...
+
+
+## Compare the CV estimates to the true map accuracy
+
+Since it's a simulated case study, we can calculate the true accuracy of the predictions.
+Therefore, we use one of the trained models to make predictions for the entire study area and we assess the true prediction accuracy by comparing prediction and response.
+Note that it doesn't matter which model we use here because no tuning was done, which means that all three models produce more or less the same results (of course with some randomness). CV was so far only used for performance assessment (test it if you don't believe it by producing predictions made by the three models.)
+
+```{r predict, message=FALSE, warning=FALSE}
+prediction <- predict(predictors,model_random)
+truediff <- abs(prediction-response)
+plot(stack(prediction,truediff),main=c("prediction","true absolute error"))
+
+### calculate the true map accuracy (in terms of RMSE and R²)
+rmse <- function(pred,obs){sqrt( mean((pred - obs)^2, na.rm = TRUE) )}
+rmse(values(response),values(prediction))
+
+```
+
+
+As we can see, the performance estimates made by spatial CV as well as NNDM are much closer to the true map accuracy than the random CV performance estimate.
+
+
+## Summary on the topic of cross-validation
+
+In the previous sections we have  
+
+1. explored how to visually assess how representative the chosen CV is based on nearest neighbor distance distribution plots
+2. learned about nearest neighbor distance matching as a new method to assess the map accuracy 
+3. seen that default random CV is not a suitable method for spatially clustered data, while NNDM and a well chosen spatial CV provide good proxies for map accuracy. 
+
+So we have leanred about cross-validation to assess the map accuracy, but changing the cross-validation strategy just for performance assessment doesn't change the model.
+In the next section, we'll explore how a suitable CV can be used during model tuning (i.e. variable selection) to improve the prediction models.
+
+# Spatial variable selection
+
+The idea of using cross-validation during model tuning (including variable selection) is to find the ideal parameters to for spatial prediction.
+I.e. which predictor variables are most suitable to map the response variable. As outlined in https://doi.org/10.1016/j.ecolmodel.2019.108815 and https://doi.org/10.1016/j.envsoft.2017.12.001,
+the ideal predictors for spatial mapping might considerably differ from the predictors needed in order to reproduce the training data. Therefore, we will see here, how we can use a spatial variable selection to (hopefully) improve our prediction model.
+
+Therefore, we use a forward variable (/feature) selection in conjunction with spatial CV. The feature selection is a wrapper around caret's tarin function. The strategy will first test for each combination of two predictors, which 2 predictors lead to the highest spatial CV performance. Based on the 2 best performing predictors, the number of predictors will be increased until none of the remaining variables increases the spatial CV perfor5mance.
+
+Since the spatial (leave-block-out) CV was doing an acceptable job, we'll use this one here (note: I would prefer NNDM if we had the time to wait for it...).
+We want to focus on the effect of variable selection here and therefore, to keep calculation times minimal, we will not do additinal hyperparameter tuning but simply set mtry to the value 2.
+
+
+```{r varselect, message=FALSE, warning= FALSE}
+model_ffs <- ffs(trainDat[,names(predictors)],
+                 trainDat$response,
+                 method="rf",
+                 ntree=100,
+                 importance=TRUE,
+                 tuneGrid = data.frame("mtry"=2),
+                 trControl = trainControl(method="cv",
+                                          index=spatial_cv$index,
+                                          savePredictions = TRUE),
+                 verbose=FALSE)
+model_ffs
+plot_ffs(model_ffs)
+
+
+### do cross-validation again with NNDM using selected variables only
+model_nndm <- train(trainDat[,model_ffs$selectedvars],
+                 trainDat$response,
+                 method="rf",
+                 ntree=100,
+                 importance=TRUE,
+                 tuneGrid = data.frame("mtry"=2),
+                 trControl = trainControl(method="cv",
+                                          index=NNDM_cv$indx_train,
+                                          indexOut=NNDM_cv$indx_test,
+                                          savePredictions = TRUE))
+
+model_nndm
+
+```
+
+We can see that the estimated performance is higher compared to the previous model that used all variables.
+Let's check if this is also the case for the true map accuracy:
+
+```{r varselectresults, message=FALSE, warning= FALSE}
+
+prediction <- predict(predictors,model_nndm)
+truediff <- abs(prediction-response)
+plot(stack(prediction,truediff),main=c("prediction","true absolute error"))
+
+### calculate the true map accuracy (in terms of RMSE and R²)
+rmse(values(response),values(prediction))
+
+```
+
+
+We see that we could indeed improve our prediction model. But what is still missing is the information about the area for which our model was enabled to learn about relationships and where, as a consequence, the estimated performance can expected to hold.
+
+
+# Estimating the area of applicability
+
+
+We have seen that technically, the trained model can be applied to the entire area of interest (and beyond...as long as the predictors are available which they are, even globally). But we should assess if we SHOULD apply our model to the entire area. The model should only be applied to locations that feature predictor properties that are comparable to those of the training data (see https://doi.org/10.1111/2041-210X.13650).
+
+We therefore estimate the area of applicability using the trained model.
+
+
+```{r uncert, message=FALSE, warning= FALSE}
+
+AOA <- aoa(predictors,model=model_nndm)
+plot(AOA)
+
+```
+
+
+The result of the aoa function has two layers: the dissimilarity index (DI) and the area of applicability (AOA). The DI can take values from 0 to Inf, where 0 means that a location has predictor properties that are identical to properties observed in the training data. With increasing values the dissimilarity increases. The AOA has only two values: 0 and 1. 0 means that a location is outside the area of applicability, 1 means that the model is inside the area of applicability. Find more information on how the AOA is derived in [Meyer\&Pebesma (2020)](https://doi.org/10.1111/2041-210X.13650).
+
+
+```{r prepare_comp, message=FALSE, warning= FALSE}
+compare <- stack(response,prediction,truediff, 
+                 AOA$DI,AOA$AOA)
+names(compare) <- c("response","prediction","true_diff","DI","AOA")
+plot(compare,col=viridis(100))
+
+```
+
+
+Now we can also calculate the true prediction error inside the AOA and compare it again with the estimated performance based on cross-validation.
+
+```{r prepare_comp2, message=FALSE, warning= FALSE}
+masked_data <- mask(stack(response,prediction),
+                     AOA$AOA,
+                     maskvalue=0)
+rmse(values(masked_data[[1]]),values(masked_data[[2]]))
+```
+
+## DI as a quantitative uncertainty measure?
+
+The AOA gives an indication about the area for which the expected CV performance may hold.
+If we chose a random CV we would end up with a high CV performance but a small AOA. This is because teh threshold to derive the AOA is based on the CV and since a random CV produces only prediction situations where no significant extrapolation is requred, we would expect that the estimated performance only applies to areas that are highly comparable to the training locations.
+
+We can use this behavior and use multiple CV's - ranging from prediction situations that don't require any extrapolation at all up to extremely difficulat prediction situations.
+This allows us to explore the relationship between the DI and the prediction performance which then eventually would allow mapping the expected performance in dependence on the dissimilarity to the prediction locations. 
+
+
+```{r calibrate, message=FALSE, warning= FALSE}
+AOA_calib <- calibrate_aoa(AOA, model_spatial,multiCV = TRUE)
+plot(AOA_calib$AOA$expected_RMSE, col=viridis(100))
+### mark areas outside the AOA
+plot(AOA_calib$AOA$AOA,col=c("pink","transparent"),add=TRUE,legend=F)
+legend("topleft",col="pink",pch=15,legend="outside AOA",bty="n")
+
+```
+
+
+# Excursus: NNDM validation and estimating the area of applicability with mlr3
+The OpenGeoHub tutorial from Patrick Schratz introduces mlr3 compared to caret as it is used here. CAST is a wrapper around caret but the most recent and central methods that are implemented (NNDM and the AOA) can also be used with mlr3.
+
+```{r mlr3example, message=FALSE, warning= FALSE, results='hide'}
+library(mlr3)
+library(mlr3learners)
+library(mlr3spatial)
+library(mlr3spatiotempcv)
+library(mlr3extralearners)
+library(mlr3measures)
+
+# initiate and train model:
+backend <- as_data_backend(trainDat[,c(model_ffs$selectedvars, "response")])
+task <- as_task_regr(backend, target = "response")
+lrn <- lrn("regr.randomForest", importance = "mse")
+lrn$train(task)
+
+# estimate performance via NNDM cross-validation:
+custom <- rsmp("custom")
+train_sets <- NNDM_cv$indx_train # derived from CAST package
+test_sets <- NNDM_cv$indx_test
+rsmp_cv <- custom$instantiate(task, train_sets, test_sets)
+
+rr <- resample(task, lrn, rsmp_cv)
+ 
+
+## predict:
+prediction <- predict(predictors,lrn$model)
+
+### Estimate AOA
+AOA <- aoa(predictors,
+           train = as.data.frame(task$data()),
+           variables = task$feature_names,
+           weight = data.frame(t(lrn$importance())),
+           CVtest = rsmp_cv$instance$test,
+           CVtrain = rsmp_cv$instance$train)
+
+```
+
+Now we can check that we produced about the same results as we did with caret (of course there is still always a bit of randomness involved in the model training)
+
+```{r mlr3exampleOutput, message=FALSE, warning= FALSE}
+rr$aggregate(measure=msr("regr.rmse")) 
+plot(AOA) 
+```
+
+# Further reading
+
+
+## Tutorials
+
+* [Introduction to CAST](https://hannameyer.github.io/CAST/articles/cast01-CAST-intro.html)
+
+* [Area of applicability of spatial prediction models](https://hannameyer.github.io/CAST/articles/cast02-AOA-tutorial.html)
+
+* [Area of applicability in parallel](https://hannameyer.github.io/CAST/articles/cast03-AOA-parallel.html)
+
+* [Visualization of nearest neighbor distance distributions](https://hannameyer.github.io/CAST/articles/cast04-plotgeodist.html)
+
+* The talk from the OpenGeoHub summer school 2019 on spatial validation and variable selection:
+https://www.youtube.com/watch?v=mkHlmYEzsVQ.
+
+* Tutorial (https://youtu.be/EyP04zLe9qo) and Lecture (https://youtu.be/OoNH6Nl-X2s) recording from OpenGeoHub summer school 2020 on the area of applicability. As well as talk at the OpenGeoHub summer school 2021: https://av.tib.eu/media/54879
+
+
+
+## Scientific documentation of the methods
+
+* Meyer, H., Reudenbach, C., Hengl, T., Katurji, M., Nauss, T. (2018): Improving performance of spatio-temporal machine learning models using forward feature selection and target-oriented validation. Environmental Modelling & Software, 101, 1-9. https://doi.org/10.1016/j.envsoft.2017.12.001
+
+* Meyer, H., Reudenbach, C., Wöllauer, S., Nauss, T. (2019): Importance of spatial predictor variable selection in machine learning applications - Moving from data reproduction to spatial prediction. Ecological Modelling. 411. https://doi.org/10.1016/j.ecolmodel.2019.108815
+
+* Meyer, H., Pebesma, E. (2021). Predicting into unknown space? Estimating the area of applicability of spatial prediction models. Methods in Ecology and Evolution, 12, 1620– 1633. https://doi.org/10.1111/2041-210X.13650 
+
+* Meyer, H., Pebesma, E. (2022): Machine learning-based global maps of ecological variables and the challenge of assessing them. Nature Communications, 13. https://www.nature.com/articles/s41467-022-29838-9
+
+* Milà, C., Mateu, J., Pebesma, E., Meyer, H. (2022): Nearest Neighbour Distance Matching Leave-One-Out Cross-Validation for map validation. Methods in Ecology and Evolution 00, 1– 13.
+https://doi.org/10.1111/2041-210X.13851
