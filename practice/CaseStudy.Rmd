@@ -35,7 +35,6 @@ Let's first load the required libraries. Major functionality discussed in the le
 This tutorial still uses the raster package to show things. Be aware that this needs to be changed in the near future...
 
 ```{r libraries, message = FALSE, warning=FALSE}
-rm(list=ls())
 #install_github("HannaMeyer/CAST")
 library(virtualspecies)
 library(caret)
@@ -43,10 +42,7 @@ library(CAST)
 library(viridis)
 library(sf)
 library(raster)
-library(gridExtra)
 library(knitr)
-library(grid)
-library(latticeExtra)
 
 # and let's set a seed for everything that involves randomness
 # Of course I took a seed here that produced results 
@@ -156,7 +152,7 @@ Now let's visualize the created response variable and the training data points
 
 plot(response,main="response")
 plot(samplepoints,add=T, col="black",cex=0.5)
-legend("topleft",pch=1,legend=c("training","validation"),bty="n",col=c("black","blue"),pt.cex=c(0.5,0.1))
+legend("topleft",pch=1,legend="training",bty="n",col="black",pt.cex=0.5)
 ```
 
 
@@ -459,31 +455,36 @@ library(mlr3spatiotempcv)
 library(mlr3extralearners)
 library(mlr3measures)
 
-# initiate and train model:
+# initiate the model. 
+# note: here we will define folds manually (via CAST's NNDM). Therefore we can define a "normal" task,
+# because the spatial component is handeld in CAST. If this is not the case, create a TaskRegrST via mlr3spatiotempcv::as_task_regr_st
+
 backend <- as_data_backend(trainDat[,c(model_ffs$selectedvars, "response")])
-task <- as_task_regr(backend, target = "response")
-lrn <- lrn("regr.randomForest", importance = "mse")
-lrn$train(task)
+task <- as_task_regr(backend, target = "response") 
+learner <- lrn("regr.randomForest", importance = "mse")
+learner$train(task)
 
-# estimate performance via NNDM cross-validation:
+# Prepare Cross-validation
 custom <- rsmp("custom")
-train_sets <- NNDM_cv$indx_train # derived from CAST package
-test_sets <- NNDM_cv$indx_test
-rsmp_cv <- custom$instantiate(task, train_sets, test_sets)
+train_sets <- NNDM_cv$indx_train # derived from CAST::nndm
+test_sets <- NNDM_cv$indx_test # derived from CAST::nndm
+rsmp_spcv_custom <- custom$instantiate(task, train_sets, test_sets) #create folds
 
-rr <- resample(task, lrn, rsmp_cv)
+# Model training and cross-validation
+set.seed(seed)
+rr <- mlr3::resample(task, learner, rsmp_spcv_custom) 
  
 
 ## predict:
-prediction <- predict(predictors,lrn$model)
+prediction <- predict(predictors,learner$model)
 
 ### Estimate AOA
 AOA <- aoa(predictors,
            train = as.data.frame(task$data()),
            variables = task$feature_names,
-           weight = data.frame(t(lrn$importance())),
-           CVtest = rsmp_cv$instance$test,
-           CVtrain = rsmp_cv$instance$train)
+           weight = data.frame(t(learner$importance())),
+           CVtest = rsmp_spcv_custom$instance$test,
+           CVtrain = rsmp_spcv_custom$instance$train)
 
 ```
 
